@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import bisect
+import heapq
 import json
 import math
 from datetime import datetime, timezone
@@ -1654,6 +1655,204 @@ class AuditService:
             pa["x"] + (pb["x"] - pa["x"]) * ratio,
             pa["y"] + (pb["y"] - pa["y"]) * ratio,
         )
+
+    # ------------------------------------------------------------------
+    # 事故后危险区内车次间接触传播追踪
+    # ------------------------------------------------------------------
+
+    def query_contact_tracing(self, zone_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """事故后追踪危险区内车次间可能的接触传播。
+
+        - 输入：危险区 ID、源车次、包含源车的至少两辆互异车次、带时区 UTC 半开时段、
+          正且有限的距离阈值，可选区域修订号与逐车轨迹版本；省略版本取同一已提交读
+          视图的最新状态；
+        - 区域与全部车次点集从**同一已提交读视图**读取，并发更新不会拼出不存在的组合；
+        - 可传递性沿用近距离相遇复核的全部规则：相邻点线性插值、区域窗口与带洞边界，
+          仅距离严格小于阈值的**正时长**相遇区间可传递；
+        - 源车在查询起点已到达；上游到达时刻早于某段相遇终点时，下游最早可在
+          该段起点与上游到达时刻的较晚者到达，按不倒退的时间接续，可多跳；
+        - 返回每车最早可达时刻与一条车次链；同刻优先跳数少，再按车次 ID 序列排序；
+          未可达明确标记（reachable=false，到达时刻与链为 null）。
+        """
+        if not isinstance(zone_id, str) or not zone_id.strip():
+            raise ValidationError("zone_id 必须是非空字符串")
+        zone_id = zone_id.strip()
+
+        # ---- 请求校验（源车 / 车次互异 / 时间范围 / 距离阈值 / 逐车版本格式）----
+        source_raw = payload.get("source_trip_id")
+        if not isinstance(source_raw, str) or not source_raw.strip():
+            raise ValidationError("source_trip_id 必须是非空字符串")
+        source = source_raw.strip()
+
+        trip_ids_raw = payload.get("trip_ids")
+        if not isinstance(trip_ids_raw, list) or len(trip_ids_raw) < 2:
+            raise ValidationError("trip_ids 必须包含至少两辆车次")
+        trip_ids: List[str] = []
+        for idx, tid in enumerate(trip_ids_raw):
+            if not isinstance(tid, str) or not tid.strip():
+                raise ValidationError(f"trip_ids[{idx}] 必须是非空字符串")
+            tid = tid.strip()
+            if tid in trip_ids:
+                raise ValidationError(f"trip_ids 中车次重复: {tid!r}（各车次必须互异）")
+            trip_ids.append(tid)
+        if source not in trip_ids:
+            raise ValidationError(
+                f"source_trip_id={source!r} 必须包含在 trip_ids 中：{trip_ids!r}"
+            )
+
+        try:
+            lo = parse_utc(payload.get("since"), field="since").timestamp()
+            hi = parse_utc(payload.get("until"), field="until").timestamp()
+        except TimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        if lo >= hi:
+            raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
+
+        max_distance = self._validate_max_distance(payload.get("max_distance"))
+
+        pinned_rev = payload.get("revision") is not None
+        revision = (
+            _validate_revision_param(payload.get("revision")) if pinned_rev else None
+        )
+
+        track_versions_raw = payload.get("track_versions") or {}
+        if not isinstance(track_versions_raw, dict):
+            raise ValidationError("track_versions 必须是 {车次: 版本号} 对象")
+        pinned_versions: Dict[str, int] = {}
+        for tid, raw_v in track_versions_raw.items():
+            if tid not in trip_ids:
+                raise ValidationError(
+                    f"track_versions 包含未在 trip_ids 中的车次: {tid!r}"
+                )
+            pinned_versions[tid] = self._validate_track_version_value(raw_v)
+
+        # ---- 同一已提交读视图：区域 + 全部车次点集一次快照读取 ----
+        with self.db.read_view() as conn:
+            if pinned_rev:
+                head_rev = self.db._current_revision(conn)
+                if revision > head_rev:
+                    raise NotFoundError(
+                        f"修订号 {revision} 超出当前范围：当前最新修订号为 {head_rev}"
+                        + ("（尚无任何区域登记）" if head_rev == 0 else "")
+                    )
+                zrow = self.db._zone_row_at(conn, zone_id, revision)
+                if zrow is None:
+                    raise NotFoundError(
+                        f"修订号 {revision} 的配置中危险区尚未登记: {zone_id}"
+                    )
+            else:
+                zrow = self.db._latest_zone_row(conn, zone_id)
+                if zrow is None:
+                    raise NotFoundError(f"危险区不存在: {zone_id}")
+
+            per_trip: List[Tuple[str, int, List[Any]]] = []
+            for tid in trip_ids:
+                if tid in pinned_versions:
+                    version = pinned_versions[tid]
+                    baseline, head = self.db._trip_version_info(conn, tid)
+                    self._check_track_version_range(tid, version, baseline, head)
+                    points = self.db._list_trip_point_version_rows(conn, tid, version)
+                else:
+                    vrow = self.db._trip_version_row(conn, tid)
+                    points = self.db._list_trip_points(conn, tid)
+                    if vrow is None and not points:
+                        raise NotFoundError(f"车次不存在（无轨迹数据）: {tid}")
+                    version = 0 if vrow is None else int(vrow["version"])
+                per_trip.append((tid, version, points))
+
+            # 各车“轨迹覆盖且位于区内”的时间区间（同一快照数据，纯计算）
+            coverage: Dict[str, List[Tuple[float, float]]] = {
+                tid: self._coverage_intervals(zrow, points, lo, hi)
+                for tid, _version, points in per_trip
+            }
+
+        # ---- 无序车次对相遇区间：沿用近距离相遇的插值/窗口/带洞/严格小于阈值规则 ----
+        points_by_trip = {tid: points for tid, _version, points in per_trip}
+        adjacency: Dict[str, List[Tuple[str, List[Tuple[float, float]]]]] = {}
+        for i in range(len(trip_ids)):
+            for j in range(i + 1, len(trip_ids)):
+                tid_a, tid_b = trip_ids[i], trip_ids[j]
+                common = clip_intervals_halfopen(coverage[tid_a], coverage[tid_b])
+                # _encounter_intervals 已保证正时长且按起点升序合并
+                intervals = [
+                    (s, e)
+                    for s, e, _min_d in self._encounter_intervals(
+                        points_by_trip[tid_a], points_by_trip[tid_b], common, max_distance
+                    )
+                ]
+                if intervals:
+                    adjacency.setdefault(tid_a, []).append((tid_b, intervals))
+                    adjacency.setdefault(tid_b, []).append((tid_a, intervals))
+
+        # ---- 时间接续传播（类 Dijkstra 标号设定）----
+        # 标号 = (最早到达时刻, 跳数, 车次链)；源车在查询起点已到达（0 跳）。
+        # 边权由上游到达时刻决定：对相遇段 [s,e)，仅当到达 < e 时可在 max(到达,s) 到达
+        # 下游——时间不倒退的 FIFO 网络，按 (时刻, 跳数, 链序) 出队即为最优标号。
+        best: Dict[str, Tuple[float, int, Tuple[str, ...]]] = {
+            source: (lo, 0, (source,))
+        }
+        heap: List[Tuple[float, int, Tuple[str, ...], str]] = [(lo, 0, (source,), source)]
+        settled: set = set()
+        while heap:
+            t_arrive, hops, chain, tid = heapq.heappop(heap)
+            if tid in settled:
+                continue
+            settled.add(tid)
+            for other, intervals in adjacency.get(tid, ()):
+                if other in settled:
+                    continue
+                # 相遇段按起点升序：首个终点晚于上游到达时刻的段给出最早可达时刻
+                ends = [e for _s, e in intervals]
+                pos = bisect.bisect_right(ends, t_arrive)
+                if pos >= len(intervals):
+                    continue  # 上游到达不早于任何剩余相遇段的终点：不可经此边传递
+                cand_t = max(intervals[pos][0], t_arrive)
+                candidate = (cand_t, hops + 1, chain + (other,))
+                current = best.get(other)
+                if current is None or (candidate[0], candidate[1], candidate[2]) < current:
+                    best[other] = candidate
+                    heapq.heappush(
+                        heap, (candidate[0], candidate[1], candidate[2], other)
+                    )
+
+        results: List[Dict[str, Any]] = []
+        for tid in trip_ids:
+            label = best.get(tid)
+            if label is None:
+                results.append(
+                    {"trip_id": tid, "reachable": False, "arrived_at": None, "hops": None, "chain": None}
+                )
+            else:
+                arrived, hops, chain = label
+                results.append(
+                    {
+                        "trip_id": tid,
+                        "reachable": True,
+                        "arrived_at": _iso_z(datetime.fromtimestamp(arrived, timezone.utc)),
+                        "hops": hops,
+                        "chain": list(chain),
+                    }
+                )
+
+        result: Dict[str, Any] = {
+            "zone_id": zone_id,
+            "source_trip_id": source,
+            "since": _iso_z(datetime.fromtimestamp(lo, timezone.utc)),
+            "until": _iso_z(datetime.fromtimestamp(hi, timezone.utc)),
+            "max_distance": max_distance,
+            "trips": [
+                {
+                    "trip_id": tid,
+                    "track_version": version,
+                    "point_count": len(points),
+                }
+                for tid, version, points in per_trip
+            ],
+            "results": results,
+        }
+        if pinned_rev:
+            result["revision"] = revision
+        return result
 
     # ------------------------------------------------------------------
     # 危险区通行许可（登记 / 撤销 / 许可复核）

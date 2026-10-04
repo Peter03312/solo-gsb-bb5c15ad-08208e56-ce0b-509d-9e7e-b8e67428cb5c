@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import get_settings
 from .db import Database
-from .schemas import CoOccupancyQuery, CorrectionBatch, PermitCreate, PermitReviewQuery, PermitRevoke, PointBatch, ProximityQuery, RiskBudgetQuery, SpeedingReviewQuery, ZoneCreate
+from .schemas import CoOccupancyQuery, ContactTracingQuery, CorrectionBatch, PermitCreate, PermitReviewQuery, PermitRevoke, PointBatch, ProximityQuery, RiskBudgetQuery, SpeedingReviewQuery, ZoneCreate
 from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
@@ -26,7 +26,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
@@ -39,6 +39,10 @@ app = FastAPI(
         "被多辆作业车同时占用的时段，返回达到阈值的区间及区间内恒定的车次集合。"
         "近距离相遇复核按同一已提交读视图比较两车同时位于区内时的平面距离，"
         "按无序车次对返回距离严格小于阈值的正时长区间及区间最小距离。"
+        "事故后接触传播追踪沿可传递的近距离相遇区间按同一已提交读视图做多跳时间接续："
+        "源车在查询起点已到达，上游到达时刻早于相遇段终点时下游最早可在该段起点与"
+        "上游到达时刻的较晚者到达，返回每车最早可达时刻与车次链，"
+        "同刻优先跳数少、再按车次 ID 序列排序，未可达明确标记。"
         "单车危险区风险预算复核按同一已提交读视图核算一次作业内各区占用，"
         "重叠区域同时占用只按最高权重计入，返回恒权重区间、各段与总计加权秒数"
         "及累计值首次达到预算的时刻。"
@@ -97,6 +101,7 @@ def index() -> dict:
             "GET  /api/v1/trips/{trip_id}/crossings",
             "POST /api/v1/zones/{zone_id}/co-occupancy",
             "POST /api/v1/zones/{zone_id}/proximity",
+            "POST /api/v1/zones/{zone_id}/contact-tracing",
             "POST /api/v1/trips/{trip_id}/risk-budget",
             "POST /api/v1/trips/{trip_id}/speeding-review",
             "POST /api/v1/permits",
@@ -259,6 +264,15 @@ def query_proximity(zone_id: str, body: ProximityQuery) -> dict:
     只在两车均有轨迹覆盖且同时位于区内时比较同一时刻平面距离，
     按无序车次对返回距离严格小于阈值的正时长区间及区间最小距离。"""
     return service.query_proximity(zone_id, body.model_dump())
+
+
+@app.post("/api/v1/zones/{zone_id}/contact-tracing")
+def query_contact_tracing(zone_id: str, body: ContactTracingQuery) -> dict:
+    """事故后危险区内车次间接触传播追踪：区域与全部车次点集从同一已提交读视图读取；
+    仅正时长且距离严格小于阈值的相遇区间可传递，源车在查询起点已到达，
+    按不倒退的时间多跳接续，返回每车最早可达时刻与一条车次链
+    （同刻优先跳数少，再按车次 ID 序列排序），未可达明确标记。"""
+    return service.query_contact_tracing(zone_id, body.model_dump())
 
 
 @app.post("/api/v1/trips/{trip_id}/risk-budget")

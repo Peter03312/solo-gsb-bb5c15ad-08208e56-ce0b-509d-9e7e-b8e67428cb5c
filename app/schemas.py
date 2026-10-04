@@ -190,6 +190,34 @@ class ProximityQuery(BaseModel):
     )
 
 
+class ContactTracingQuery(BaseModel):
+    """事故后危险区内车次间接触传播追踪请求：沿可传递的近距离相遇区间求每车最早可达时刻。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_trip_id: str = Field(
+        ..., min_length=1, description="源车次 ID；必须包含在 trip_ids 中，查询起点即视为已到达"
+    )
+    trip_ids: List[str] = Field(
+        ..., min_length=2, description="包含源车在内的至少两辆互异车次（重复车次在服务层拒绝）"
+    )
+    since: str = Field(..., description="查询起始 UTC ISO 8601（含），必须带时区；源车此时刻已到达")
+    until: str = Field(..., description="查询结束 UTC ISO 8601（不含），必须带时区")
+    max_distance: float = Field(
+        ...,
+        gt=0,
+        allow_inf_nan=False,
+        description="米制距离阈值：正且有限，仅严格小于且正时长的相遇区间可传递",
+    )
+    revision: Optional[int] = Field(
+        default=None, ge=1, description="可选区域修订号：按截至该号的区域配置核算"
+    )
+    track_versions: Dict[str, Annotated[int, Field(ge=0)]] = Field(
+        default_factory=dict,
+        description="可选逐车轨迹版本 {trip_id: 版本号}；未列出的车次取查询时最新已提交状态",
+    )
+
+
 class PermitCreate(BaseModel):
     """作业车进入危险区通行许可登记请求：许可 ID + 车次 + 危险区 + UTC 半开覆盖时段。"""
 
